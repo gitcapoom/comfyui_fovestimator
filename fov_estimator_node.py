@@ -136,11 +136,19 @@ class FOVEstimatorNode:
         line_threshold: int
     ) -> Tuple[float, list]:
         """
-        Estimate the tilt angle (horizon angle) of the image.
+        Estimate the tilt angle (horizon angle) of the image based on horizon position.
+
+        Tilt is calculated relative to frame center:
+        - Tilt = 0° when horizon is at frame center
+        - Tilt < 0° when horizon is above center (camera looking up)
+        - Tilt > 0° when horizon is below center (camera looking down)
 
         Returns:
             Tuple of (tilt_angle_degrees, detected_horizon_lines)
         """
+        height, width = img.shape[:2]
+        frame_center_y = height / 2.0
+
         # Convert to grayscale
         if len(img.shape) == 3:
             gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
@@ -157,7 +165,7 @@ class FOVEstimatorNode:
         lines = cv2.HoughLines(edges, 1, np.pi / 180, line_threshold)
 
         horizon_lines = []
-        angles = []
+        horizon_y_positions = []
 
         if lines is not None:
             for line in lines:
@@ -166,29 +174,43 @@ class FOVEstimatorNode:
                 # Convert theta to degrees
                 angle_deg = np.degrees(theta)
 
-                # Filter for near-horizontal lines (within 45 degrees of horizontal)
-                # Theta is measured from vertical, so horizontal is around 90 or 0/180
-                if (80 <= angle_deg <= 100) or (angle_deg <= 10) or (angle_deg >= 170):
-                    # Convert to tilt angle (deviation from horizontal)
-                    if angle_deg > 90:
-                        tilt = angle_deg - 90
-                    else:
-                        tilt = 90 - angle_deg
+                # Filter for near-horizontal lines (within 15 degrees of horizontal)
+                # Theta is measured from vertical, so horizontal is around 90 degrees
+                if 75 <= angle_deg <= 105:
+                    # Calculate where this line crosses the center x of the frame
+                    # Line equation: x*cos(theta) + y*sin(theta) = rho
+                    # At x = width/2, solve for y: y = (rho - x*cos(theta)) / sin(theta)
 
-                    angles.append(tilt)
-                    horizon_lines.append((rho, theta))
+                    cos_theta = np.cos(theta)
+                    sin_theta = np.sin(theta)
 
-        # Calculate average tilt
-        if angles:
-            # Use median to be robust to outliers
-            tilt_angle = float(np.median(angles))
-            # Adjust sign based on theta
-            if horizon_lines:
-                median_theta = np.median([theta for _, theta in horizon_lines])
-                if median_theta < np.pi / 2:
-                    tilt_angle = -tilt_angle
+                    if abs(sin_theta) > 0.1:  # Avoid near-vertical lines
+                        x_center = width / 2.0
+                        y_at_center = (rho - x_center * cos_theta) / sin_theta
+
+                        # Only consider lines that cross within or near the frame
+                        if -height * 0.5 <= y_at_center <= height * 1.5:
+                            horizon_lines.append((rho, theta))
+                            horizon_y_positions.append(y_at_center)
+
+        # Calculate tilt based on horizon position relative to frame center
+        if horizon_y_positions:
+            # Use median horizon position to be robust to outliers
+            median_horizon_y = float(np.median(horizon_y_positions))
+
+            # Calculate offset from center (positive = below center)
+            y_offset = median_horizon_y - frame_center_y
+
+            # Estimate tilt angle
+            # Assume a typical FOV of 60 degrees vertically
+            # This means each pixel represents: 60 / height degrees
+            estimated_vertical_fov = 60.0  # degrees
+            degrees_per_pixel = estimated_vertical_fov / height
+
+            # Calculate tilt: positive when horizon is below center (camera tilted up)
+            tilt_angle = y_offset * degrees_per_pixel
         else:
-            tilt_angle = 0.0  # No tilt detected
+            tilt_angle = 0.0  # No horizon detected, assume level
 
         return tilt_angle, horizon_lines
 

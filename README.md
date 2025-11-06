@@ -62,9 +62,13 @@ The node will appear in ComfyUI under the **image/analysis** category as **"FOV 
 1. Converts image to grayscale
 2. Applies Gaussian blur to reduce noise
 3. Uses Canny edge detection to find edges
-4. Applies Hough line transform to detect lines
+4. Applies Hough line transform to detect horizon lines
 5. Filters for near-horizontal lines
-6. Calculates median angle as the tilt
+6. Calculates where the horizon intersects the center of the frame
+7. Measures tilt based on horizon position relative to frame center:
+   - **Tilt = 0°** when horizon is at the center of the frame
+   - **Tilt < 0°** when horizon is above center (camera looking up)
+   - **Tilt > 0°** when horizon is below center (camera looking down)
 
 ### FOV Estimation
 1. Detects edge lines in the image
