@@ -58,6 +58,13 @@ The node will appear in ComfyUI under the **image/analysis** category as **"FOV 
 
 ## How It Works
 
+### FOV Estimation
+1. Detects edge lines in the image
+2. Finds intersections between lines to locate vanishing points
+3. Calculates the angular separation between vanishing points
+4. Estimates horizontal FOV based on vanishing point geometry
+5. Falls back to aspect ratio-based estimation if vanishing points aren't found
+
 ### Tilt Detection
 1. Converts image to grayscale
 2. Applies Gaussian blur to reduce noise
@@ -65,17 +72,11 @@ The node will appear in ComfyUI under the **image/analysis** category as **"FOV 
 4. Applies Hough line transform to detect horizon lines
 5. Filters for near-horizontal lines
 6. Calculates where the horizon intersects the center of the frame
-7. Measures tilt based on horizon position relative to frame center:
+7. Converts horizontal FOV to vertical FOV using the image aspect ratio
+8. Measures tilt based on horizon position relative to frame center using the estimated vertical FOV:
    - **Tilt = 0°** when horizon is at the center of the frame
    - **Tilt < 0°** when horizon is above center (camera looking up)
    - **Tilt > 0°** when horizon is below center (camera looking down)
-
-### FOV Estimation
-1. Detects edge lines in the image
-2. Finds intersections between lines to locate vanishing points
-3. Calculates the angular separation between vanishing points
-4. Estimates FOV based on vanishing point geometry
-5. Falls back to aspect ratio-based estimation if vanishing points aren't found
 
 ## Tips
 

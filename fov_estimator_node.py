@@ -93,13 +93,14 @@ class FOVEstimatorNode:
             # Convert from [0, 1] float to [0, 255] uint8
             img_np = (img_np * 255).astype(np.uint8)
 
-            # Estimate tilt and FOV
-            tilt_angle, horizon_lines = self._estimate_tilt(
+            # Estimate FOV first, then use it for tilt calculation
+            fov_angle, vanishing_points = self._estimate_fov(
                 img_np, edge_threshold_low, edge_threshold_high, line_threshold
             )
 
-            fov_angle, vanishing_points = self._estimate_fov(
-                img_np, edge_threshold_low, edge_threshold_high, line_threshold
+            # Estimate tilt using the calculated FOV
+            tilt_angle, horizon_lines = self._estimate_tilt(
+                img_np, edge_threshold_low, edge_threshold_high, line_threshold, fov_angle
             )
 
             # Create visualization if requested
@@ -133,7 +134,8 @@ class FOVEstimatorNode:
         img: np.ndarray,
         threshold1: int,
         threshold2: int,
-        line_threshold: int
+        line_threshold: int,
+        fov_horizontal: float
     ) -> Tuple[float, list]:
         """
         Estimate the tilt angle (horizon angle) of the image based on horizon position.
@@ -143,11 +145,19 @@ class FOVEstimatorNode:
         - Tilt < 0° when horizon is above center (camera looking up)
         - Tilt > 0° when horizon is below center (camera looking down)
 
+        Args:
+            fov_horizontal: Estimated horizontal field of view in degrees
+
         Returns:
             Tuple of (tilt_angle_degrees, detected_horizon_lines)
         """
         height, width = img.shape[:2]
         frame_center_y = height / 2.0
+
+        # Calculate vertical FOV from horizontal FOV using aspect ratio
+        aspect_ratio = width / height
+        # tan(vfov/2) = tan(hfov/2) / aspect_ratio
+        fov_vertical = 2 * np.degrees(np.arctan(np.tan(np.radians(fov_horizontal / 2)) / aspect_ratio))
 
         # Convert to grayscale
         if len(img.shape) == 3:
@@ -201,11 +211,9 @@ class FOVEstimatorNode:
             # Calculate offset from center (positive = below center)
             y_offset = median_horizon_y - frame_center_y
 
-            # Estimate tilt angle
-            # Assume a typical FOV of 60 degrees vertically
-            # This means each pixel represents: 60 / height degrees
-            estimated_vertical_fov = 60.0  # degrees
-            degrees_per_pixel = estimated_vertical_fov / height
+            # Calculate tilt angle using the estimated vertical FOV
+            # Each pixel represents: vertical_fov / height degrees
+            degrees_per_pixel = fov_vertical / height
 
             # Calculate tilt: positive when horizon is below center (camera tilted up)
             tilt_angle = y_offset * degrees_per_pixel
