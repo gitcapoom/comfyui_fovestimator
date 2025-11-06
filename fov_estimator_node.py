@@ -230,11 +230,16 @@ class FOVEstimatorNode:
         line_threshold: int
     ) -> Tuple[float, list]:
         """
-        Estimate the Field of View by detecting vanishing points.
+        Estimate the Field of View using vanishing point and focal length estimation.
+
+        Uses the relationship: focal_length = width / (2 * tan(hfov/2))
+        The distance from image center to a vanishing point approximates the focal length.
 
         Returns:
             Tuple of (fov_angle_degrees, vanishing_points)
         """
+        height, width = img.shape[:2]
+
         # Convert to grayscale
         if len(img.shape) == 3:
             gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
@@ -253,76 +258,141 @@ class FOVEstimatorNode:
             rho=1,
             theta=np.pi / 180,
             threshold=line_threshold // 2,
-            minLineLength=img.shape[1] // 10,
-            maxLineGap=img.shape[1] // 20
+            minLineLength=min(width, height) // 10,
+            maxLineGap=min(width, height) // 20
         )
 
         vanishing_points = []
+        fov = None
 
-        if lines is not None and len(lines) > 1:
-            # Find vanishing points by finding line intersections
-            vanishing_points = self._find_vanishing_points(lines, img.shape)
+        if lines is not None and len(lines) > 3:
+            # Find the dominant vanishing point
+            vanishing_point, supporting_lines = self._find_dominant_vanishing_point(lines, (height, width))
 
-        # Estimate FOV based on vanishing points
-        if len(vanishing_points) >= 2:
-            # Calculate angle between vanishing points
-            fov = self._calculate_fov_from_vanishing_points(vanishing_points, img.shape)
-        else:
-            # Default FOV estimate based on image aspect ratio
-            # Typical camera FOV ranges from 50-90 degrees
-            aspect_ratio = img.shape[1] / img.shape[0]
-            # Estimate: wider aspect ratio suggests wider FOV
-            fov = 50 + (aspect_ratio - 1.0) * 30
-            fov = np.clip(fov, 40, 120)
+            if vanishing_point is not None:
+                vanishing_points.append(vanishing_point)
+
+                # Calculate FOV from vanishing point position
+                # The distance from principal point (image center) to vanishing point
+                # approximates the focal length in pixels
+                principal_point = np.array([width / 2.0, height / 2.0])
+                vp_array = np.array(vanishing_point)
+
+                # For horizontal FOV, use the horizontal distance
+                focal_length_estimate = abs(vp_array[0] - principal_point[0])
+
+                # If vanishing point is too close to center, use the Euclidean distance
+                if focal_length_estimate < width * 0.1:
+                    focal_length_estimate = np.linalg.norm(vp_array - principal_point)
+
+                # Ensure reasonable focal length
+                focal_length_estimate = max(focal_length_estimate, width * 0.2)
+
+                # Calculate horizontal FOV from focal length
+                # hfov = 2 * arctan(width / (2 * focal_length))
+                fov = 2 * np.degrees(np.arctan(width / (2 * focal_length_estimate)))
+
+                # Clamp to reasonable range
+                fov = np.clip(fov, 15, 150)
+
+        # If no good vanishing point found, use a more conservative default
+        if fov is None:
+            # Default based on typical camera FOV (smartphone ~70°, DSLR ~50°, wide ~90°)
+            # Use aspect ratio as a hint
+            aspect_ratio = width / height
+            if aspect_ratio > 2.0:  # Ultra-wide panorama
+                fov = 100.0
+            elif aspect_ratio > 1.7:  # Wide aspect (16:9, etc.)
+                fov = 70.0
+            elif aspect_ratio > 1.2:  # Standard aspect (4:3, 3:2)
+                fov = 55.0
+            else:  # Square or portrait
+                fov = 50.0
 
         return float(fov), vanishing_points
 
-    def _find_vanishing_points(
+    def _find_dominant_vanishing_point(
         self,
         lines: np.ndarray,
-        img_shape: Tuple[int, ...]
-    ) -> list:
+        img_shape: Tuple[int, int]
+    ) -> Tuple[Tuple[float, float], int]:
         """
-        Find vanishing points from line intersections.
-        """
-        vanishing_points = []
-        height, width = img_shape[:2]
+        Find the most dominant vanishing point using RANSAC-like clustering.
 
-        # Convert lines to point pairs
+        Returns:
+            Tuple of (vanishing_point, num_supporting_lines) or (None, 0) if none found
+        """
+        height, width = img_shape
+        principal_point = np.array([width / 2.0, height / 2.0])
+
+        # Convert lines to point pairs and filter out near-horizontal lines
+        # (we want lines that converge, like roads, buildings)
         line_list = []
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            line_list.append(((x1, y1), (x2, y2)))
 
-        # Find intersections between non-parallel lines
+            # Calculate line angle
+            dx = x2 - x1
+            dy = y2 - y1
+            angle = abs(np.degrees(np.arctan2(dy, dx)))
+
+            # Filter: keep lines that are NOT horizontal (skip 80-100 degrees from vertical)
+            # We want converging lines (vertical-ish or diagonal)
+            if not (10 <= angle <= 170):  # Skip near-horizontal
+                continue
+
+            line_list.append(((float(x1), float(y1)), (float(x2), float(y2))))
+
+        if len(line_list) < 3:
+            return None, 0
+
+        # Find all pairwise intersections
         intersections = []
+        intersection_line_pairs = []
+
         for i in range(len(line_list)):
-            for j in range(i + 1, len(line_list)):
+            for j in range(i + 1, min(i + 50, len(line_list))):  # Limit combinations for performance
                 pt = self._line_intersection(line_list[i], line_list[j])
                 if pt is not None:
-                    intersections.append(pt)
+                    # Only consider intersections within reasonable bounds
+                    if (-width <= pt[0] <= 2*width) and (-height <= pt[1] <= 2*height):
+                        intersections.append(pt)
+                        intersection_line_pairs.append((i, j))
 
-        if not intersections:
-            return []
+        if len(intersections) < 3:
+            return None, 0
 
-        # Cluster intersections to find vanishing points
-        # Use simple spatial clustering
         intersections = np.array(intersections)
 
-        # Filter out intersections too far from image center
-        center = np.array([width / 2, height / 2])
-        max_dist = max(width, height) * 2  # Allow points outside image but not too far
-        distances = np.linalg.norm(intersections - center, axis=1)
-        valid_intersections = intersections[distances < max_dist]
+        # Cluster intersections to find dominant vanishing point
+        # Use a voting scheme: find the point with most nearby intersections
+        best_vp = None
+        best_support = 0
 
-        if len(valid_intersections) > 0:
-            # Simple clustering: find dense regions
-            # For now, just return the median point if we have enough intersections
-            if len(valid_intersections) >= 3:
-                median_point = np.median(valid_intersections, axis=0)
-                vanishing_points.append(tuple(median_point))
+        # Sample potential vanishing points
+        sample_indices = np.linspace(0, len(intersections)-1, min(20, len(intersections)), dtype=int)
 
-        return vanishing_points
+        for idx in sample_indices:
+            candidate = intersections[idx]
+
+            # Count how many intersections are near this candidate
+            distances = np.linalg.norm(intersections - candidate, axis=1)
+
+            # Dynamic threshold based on image size
+            threshold = max(width, height) * 0.15
+            support = np.sum(distances < threshold)
+
+            if support > best_support:
+                best_support = support
+                # Use median of supporting points for robustness
+                supporting_points = intersections[distances < threshold]
+                best_vp = tuple(np.median(supporting_points, axis=0))
+
+        # Require at least 3 supporting intersections
+        if best_support >= 3:
+            return best_vp, best_support
+
+        return None, 0
 
     def _line_intersection(
         self,
@@ -348,43 +418,6 @@ class FOVEstimatorNode:
         py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / denom
 
         return (px, py)
-
-    def _calculate_fov_from_vanishing_points(
-        self,
-        vanishing_points: list,
-        img_shape: Tuple[int, ...]
-    ) -> float:
-        """
-        Calculate FOV from vanishing points.
-        """
-        if len(vanishing_points) < 2:
-            return 60.0  # Default
-
-        height, width = img_shape[:2]
-        center = np.array([width / 2, height / 2])
-
-        # Calculate angles from center to vanishing points
-        angles = []
-        for vp in vanishing_points[:2]:  # Use first two vanishing points
-            vp_array = np.array(vp)
-            # Calculate angle from center to vanishing point
-            diff = vp_array - center
-            angle = np.degrees(np.arctan2(diff[1], diff[0]))
-            angles.append(angle)
-
-        # FOV is related to the angular separation of vanishing points
-        angular_separation = abs(angles[1] - angles[0])
-        if angular_separation > 180:
-            angular_separation = 360 - angular_separation
-
-        # The angular separation of vanishing points relates to FOV
-        # For perpendicular lines, this gives us a good FOV estimate
-        fov = angular_separation
-
-        # Clamp to reasonable range
-        fov = np.clip(fov, 30, 150)
-
-        return float(fov)
 
     def _visualize_results(
         self,

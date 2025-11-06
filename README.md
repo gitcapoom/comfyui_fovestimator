@@ -59,11 +59,17 @@ The node will appear in ComfyUI under the **image/analysis** category as **"FOV 
 ## How It Works
 
 ### FOV Estimation
-1. Detects edge lines in the image
-2. Finds intersections between lines to locate vanishing points
-3. Calculates the angular separation between vanishing points
-4. Estimates horizontal FOV based on vanishing point geometry
-5. Falls back to aspect ratio-based estimation if vanishing points aren't found
+Uses the pinhole camera model and vanishing point analysis:
+
+1. Detects edge lines in the image using Canny edge detection and Hough transform
+2. Filters for non-horizontal lines (converging lines from buildings, roads, etc.)
+3. Finds intersections between line pairs to identify potential vanishing points
+4. Uses RANSAC-like clustering to find the dominant vanishing point (most supported by line intersections)
+5. Calculates focal length from the distance between the image center and vanishing point
+6. Converts focal length to horizontal FOV using: `hfov = 2 × arctan(width / (2 × focal_length))`
+7. Falls back to aspect ratio-based estimation if no good vanishing point is found
+
+**Key Principle:** The distance from the image center (principal point) to a vanishing point created by receding parallel lines approximates the camera's focal length in pixels. This relationship allows accurate FOV estimation from image geometry.
 
 ### Tilt Detection
 1. Converts image to grayscale
@@ -87,18 +93,27 @@ The node will appear in ComfyUI under the **image/analysis** category as **"FOV 
 
 ## Limitations
 
-- Works best on images with clear linear features (buildings, roads, horizons)
+- **FOV estimation** works best on images with clear converging lines (buildings, roads, railroad tracks)
+- **Tilt estimation** works best on images with visible horizons
 - May be less accurate on images with:
-  - Extreme wide-angle or fisheye distortion
-  - Very cluttered scenes
+  - Extreme wide-angle or fisheye distortion (non-linear distortion)
+  - Very cluttered scenes with few clear lines
   - No clear horizon or parallel lines
+  - Mostly organic/natural scenes without geometric features
 
 ## Technical Details
 
-- Uses OpenCV for computer vision operations
-- Implements Canny edge detection and Hough transforms
-- Performs vanishing point analysis for FOV estimation
-- Median-based robust estimation for tilt angle
+- **Computer Vision**: Uses OpenCV for all image processing operations
+- **Edge Detection**: Canny edge detection with configurable thresholds
+- **Line Detection**: Hough line transform for finding straight lines
+- **FOV Estimation**:
+  - RANSAC-like clustering for robust vanishing point detection
+  - Pinhole camera model for focal length estimation
+  - Handles images without clear vanishing points via aspect ratio fallback
+- **Tilt Estimation**:
+  - Horizon line detection and position analysis
+  - Converts horizontal to vertical FOV using aspect ratio
+  - Median-based robust estimation resistant to outliers
 
 ## License
 
