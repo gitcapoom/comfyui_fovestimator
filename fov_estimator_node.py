@@ -614,14 +614,14 @@ class DepthFOVEstimatorNode:
             rho=1,
             theta=np.pi / 180,
             threshold=line_threshold,
-            minLineLength=min(width, height) // 10,
-            maxLineGap=min(width, height) // 20
+            minLineLength=min(width, height) // 8,  # Longer minimum lines
+            maxLineGap=min(width, height) // 25      # Smaller gaps
         )
 
         vanishing_points = []
         fov = None
 
-        if lines is not None and len(lines) > 3:
+        if lines is not None and len(lines) > 5:  # Require more lines for reliability
             # Find dominant vanishing point from depth-based lines
             vanishing_point, supporting_lines = self._find_dominant_vanishing_point_from_lines(
                 lines, (height, width)
@@ -634,31 +634,48 @@ class DepthFOVEstimatorNode:
                 principal_point = np.array([width / 2.0, height / 2.0])
                 vp_array = np.array(vanishing_point)
 
-                # Use horizontal distance for horizontal FOV
-                focal_length_estimate = abs(vp_array[0] - principal_point[0])
+                # Calculate distance from center
+                vp_distance = np.linalg.norm(vp_array - principal_point)
 
-                # If VP is near center, use Euclidean distance
-                if focal_length_estimate < width * 0.1:
-                    focal_length_estimate = np.linalg.norm(vp_array - principal_point)
+                # For horizontal FOV, primarily use horizontal distance
+                # but validate it makes sense
+                horizontal_distance = abs(vp_array[0] - principal_point[0])
 
-                # Ensure reasonable focal length
-                focal_length_estimate = max(focal_length_estimate, width * 0.3)
+                # Use horizontal distance if VP is reasonably off-center horizontally
+                # Otherwise use Euclidean distance
+                if horizontal_distance > width * 0.15:
+                    focal_length_estimate = horizontal_distance
+                else:
+                    focal_length_estimate = vp_distance
 
-                # Calculate horizontal FOV
-                fov = 2 * np.degrees(np.arctan(width / (2 * focal_length_estimate)))
-                fov = np.clip(fov, 15, 150)
+                # Validate: reject if vanishing point is too close to center
+                # (indicates wide FOV or bad detection)
+                # For typical images, minimum focal length should be at least 0.5 * width
+                # This corresponds to ~90° FOV maximum
+                min_focal_length = width * 0.5
 
-        # Fallback if no vanishing point found
+                if focal_length_estimate < min_focal_length:
+                    # VP too close - likely a bad detection, use conservative fallback
+                    fov = None
+                else:
+                    # Calculate horizontal FOV
+                    fov = 2 * np.degrees(np.arctan(width / (2 * focal_length_estimate)))
+                    # Clamp to reasonable range
+                    fov = np.clip(fov, 15, 120)
+
+        # Fallback if no good vanishing point found
         if fov is None:
+            # Use conservative default based on aspect ratio
+            # Most cameras have FOV between 40-70 degrees
             aspect_ratio = width / height
             if aspect_ratio > 2.0:
-                fov = 100.0
+                fov = 90.0  # Ultra-wide panorama
             elif aspect_ratio > 1.7:
-                fov = 70.0
+                fov = 65.0  # Wide aspect (16:9)
             elif aspect_ratio > 1.2:
-                fov = 55.0
+                fov = 50.0  # Standard aspect (4:3, 3:2)
             else:
-                fov = 50.0
+                fov = 45.0  # Square or portrait
 
         return float(fov), vanishing_points
 
@@ -796,51 +813,83 @@ class DepthFOVEstimatorNode:
     ) -> Tuple[Tuple[float, float], int]:
         """
         Find dominant vanishing point from depth-based lines.
-        Similar to RGB version but optimized for depth discontinuities.
+        Optimized for depth discontinuities - focuses on near-vertical converging lines.
         """
         height, width = img_shape
+        principal_point = np.array([width / 2.0, height / 2.0])
 
-        # Filter for non-horizontal lines
+        # Filter for near-vertical lines that are likely to converge
         line_list = []
         for line in lines:
             x1, y1, x2, y2 = line[0]
             dx = x2 - x1
             dy = y2 - y1
-            angle = abs(np.degrees(np.arctan2(dy, dx)))
 
-            # Skip near-horizontal lines
-            if not (10 <= angle <= 170):
+            # Calculate line length
+            line_length = np.sqrt(dx**2 + dy**2)
+
+            # Skip very short lines
+            if line_length < min(width, height) * 0.05:
                 continue
 
-            line_list.append(((float(x1), float(y1)), (float(x2), float(y2))))
+            # Calculate angle from horizontal (0-180 degrees)
+            angle = abs(np.degrees(np.arctan2(dy, dx)))
 
-        if len(line_list) < 3:
+            # Focus on near-vertical lines (converging lines like building edges)
+            # Accept lines between 20-70 degrees and 110-160 degrees
+            # This filters out horizontal and diagonal lines
+            is_near_vertical = (20 <= angle <= 70) or (110 <= angle <= 160)
+
+            if is_near_vertical:
+                line_list.append(((float(x1), float(y1)), (float(x2), float(y2))))
+
+        if len(line_list) < 5:  # Need at least 5 good lines
             return None, 0
 
-        # Find intersections
+        # Find intersections between line pairs
         intersections = []
         for i in range(len(line_list)):
-            for j in range(i + 1, min(i + 50, len(line_list))):
+            for j in range(i + 1, min(i + 40, len(line_list))):
                 pt = self._line_intersection(line_list[i], line_list[j])
                 if pt is not None:
-                    if (-width <= pt[0] <= 2*width) and (-height <= pt[1] <= 2*height):
+                    # Allow intersections within extended bounds
+                    if (-width * 0.5 <= pt[0] <= width * 2.5) and (-height * 0.5 <= pt[1] <= height * 2.5):
                         intersections.append(pt)
 
-        if len(intersections) < 3:
+        if len(intersections) < 5:  # Need enough intersections
             return None, 0
 
         intersections = np.array(intersections)
+
+        # Filter intersections: prefer those farther from center
+        # (narrow FOV means VP should be far from center)
+        distances_from_center = np.linalg.norm(intersections - principal_point, axis=1)
+
+        # Only consider intersections reasonably far from center
+        # This helps avoid false positives that would indicate very wide FOV
+        min_distance = width * 0.4  # At least 40% of width from center
+        far_intersections = intersections[distances_from_center > min_distance]
+
+        if len(far_intersections) < 3:
+            # If we don't have enough far intersections, the scene may not have
+            # clear converging lines - return None to use fallback
+            return None, 0
+
+        # Use the far intersections for clustering
+        intersections = far_intersections
 
         # Find best vanishing point through clustering
         best_vp = None
         best_support = 0
 
-        sample_indices = np.linspace(0, len(intersections)-1, min(20, len(intersections)), dtype=int)
+        sample_indices = np.linspace(0, len(intersections)-1, min(15, len(intersections)), dtype=int)
 
         for idx in sample_indices:
             candidate = intersections[idx]
             distances = np.linalg.norm(intersections - candidate, axis=1)
-            threshold = max(width, height) * 0.15
+
+            # Tighter clustering threshold for more precision
+            threshold = max(width, height) * 0.10
             support = np.sum(distances < threshold)
 
             if support > best_support:
@@ -848,7 +897,8 @@ class DepthFOVEstimatorNode:
                 supporting_points = intersections[distances < threshold]
                 best_vp = tuple(np.median(supporting_points, axis=0))
 
-        if best_support >= 3:
+        # Require stronger support (more intersections agreeing)
+        if best_support >= 5:
             return best_vp, best_support
 
         return None, 0
